@@ -1,14 +1,20 @@
 use crate::deflate::{FileEntry, VaultReader, create_container};
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroize;
 
 use crate::gif_player::GifPlayer;
 use crate::particles;
 
+// Импортируем наши чистые функции рендеринга и оставшиеся вспомогательные структуры
+use crate::ui::{
+    BreadcrumbAction, CustomTitleBar, DirectoryTreeAction, FileDetailsAction, LoadingModal,
+    PasswordModal, PasswordResult, render_breadcrumb_bar, render_directory_tree,
+    render_file_details,
+};
+
 #[derive(Default, PartialEq)]
-enum AppState {
+pub enum AppState {
     #[default]
     Home,
     Browser,
@@ -33,32 +39,32 @@ pub enum ProgressMessage {
     },
     FolderPicked(PathBuf),
     SaveLocationPicked(PathBuf),
-    OpenLocationPicked(PathBuf), 
+    OpenLocationPicked(PathBuf),
 }
 
 pub struct FileBrowserApp {
-    state: AppState,
+    pub state: AppState,
     style_initialized: bool,
-    current_vfs_dir: String,
-    selected_file: Option<FileEntry>,
-    show_password_popup: bool,
-    password_buffer: String,
+    pub current_vfs_dir: String,
+    pub selected_file: Option<FileEntry>,
+    pub show_password_popup: bool,
+    pub password_buffer: String,
 
-    pending_directory: Option<PathBuf>,
-    pending_save_path: Option<PathBuf>,
-    pending_open_path: Option<PathBuf>,
+    pub pending_directory: Option<PathBuf>,
+    pub pending_save_path: Option<PathBuf>,
+    pub pending_open_path: Option<PathBuf>,
 
-    vault_reader: Option<VaultReader>,
-    progress: f32,
-    progress_message: String,
-    
-    rx: Option<mpsc::Receiver<ProgressMessage>>,
-    tx: Option<mpsc::Sender<ProgressMessage>>,
-    operation_in_progress: bool,
-    operation_result: Option<String>,
+    pub vault_reader: Option<VaultReader>,
+    pub progress: f32,
+    pub progress_message: String,
 
-    background: particles::ParticleBackground,
-    gif_player: Option<GifPlayer>,
+    pub rx: Option<mpsc::Receiver<ProgressMessage>>,
+    pub tx: Option<mpsc::Sender<ProgressMessage>>,
+    pub operation_in_progress: bool,
+    pub operation_result: Option<String>,
+
+    pub background: particles::ParticleBackground,
+    pub gif_player: Option<GifPlayer>,
 }
 
 impl Default for FileBrowserApp {
@@ -80,7 +86,6 @@ impl Default for FileBrowserApp {
             tx: None,
             operation_in_progress: false,
             operation_result: None,
-
             background: particles::ParticleBackground::default(),
             gif_player: None,
         }
@@ -184,6 +189,7 @@ impl FileBrowserApp {
         }
     }
 
+    // --- Скрин Домашнего Экрана ---
     fn render_home_screen(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::TRANSPARENT))
@@ -218,23 +224,21 @@ impl FileBrowserApp {
                 });
             });
 
-        self.render_password_popup(ui.ctx());
+        // Работа со структурами-попапами (без трейта Widget)
+        self.handle_password_popup(ui.ctx());
         self.render_loading_popup(ui.ctx());
     }
 
     fn render_encrypt_folder_button(&mut self, ui: &mut egui::Ui) {
         let button = ui.add_sized([260.0, 45.0], egui::Button::new("📁 Encrypt folder"));
-
         if button.clicked() && !self.operation_in_progress {
             if self.tx.is_none() {
                 let (tx, rx) = mpsc::channel();
                 self.tx = Some(tx);
                 self.rx = Some(rx);
             }
-
             let tx = self.tx.clone().unwrap();
             let ctx = ui.ctx().clone();
-
             std::thread::spawn(move || {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     if let Some(save_path) = rfd::FileDialog::new()
@@ -250,56 +254,16 @@ impl FileBrowserApp {
         }
     }
 
-    fn render_custom_title_bar(&mut self, ui: &mut egui::Ui) {
-        use eframe::egui::{Align, Layout, RichText, Sense, Vec2, ViewportCommand};
-
-        let height = 32.0;
-
-        let (rect, response) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), height),
-            Sense::click_and_drag(),
-        );
-
-        if response.dragged() {
-            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-        }
-
-        let mut child = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(rect)
-                .layout(Layout::left_to_right(Align::Center)),
-        );
-
-        child.add_space(8.0);
-        child.label(RichText::new("🔒").size(16.0));
-        child.add_space(6.0);
-        child.label(RichText::new("XOR-evfs").strong().size(15.0));
-
-        child.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let close = ui.add_sized(
-                [28.0, 24.0],
-                egui::Button::new(RichText::new("❌").size(14.0)).frame(false),
-            );
-
-            if close.clicked() {
-                ui.ctx().send_viewport_cmd(ViewportCommand::Close);
-            }
-        });
-    }
-
     fn render_open_evfs_button(&mut self, ui: &mut egui::Ui) {
         let button = ui.add_sized([260.0, 45.0], egui::Button::new("🔐 Open EVFS(.enc)"));
-
         if button.clicked() && !self.operation_in_progress {
             if self.tx.is_none() {
                 let (tx, rx) = mpsc::channel();
                 self.tx = Some(tx);
                 self.rx = Some(rx);
             }
-
             let tx = self.tx.clone().unwrap();
             let ctx = ui.ctx().clone();
-
             std::thread::spawn(move || {
                 if let Some(file) = rfd::FileDialog::new()
                     .add_filter("EVFS", &["enc"])
@@ -312,115 +276,125 @@ impl FileBrowserApp {
         }
     }
 
-    fn render_loading_popup(&mut self, ctx: &egui::Context) {
-        if !self.operation_in_progress || self.state != AppState::Loading {
-            return;
-        }
+    // --- Скрин Браузера Файлов ---
+    fn render_browser_screen(&mut self, ui: &mut egui::Ui) {
+        self.check_progress();
 
-        egui::Window::new("Processing...")
-            .collapsible(false)
-            .resizable(false)
-            .fixed_size([400.0, 120.0])
-            .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(&self.progress_message);
-                    ui.add_space(10.0);
+        let entries = match &self.vault_reader {
+            Some(r) => r.index.entries.clone(),
+            None => {
+                self.state = AppState::Home;
+                return;
+            }
+        };
 
-                    let progress_bar = egui::ProgressBar::new(self.progress)
-                        .show_percentage()
-                        .animate(true);
-                    ui.add_sized([300.0, 20.0], progress_bar);
-                });
-            });
+        egui::Frame::new().inner_margin(16).show(ui, |ui| {
+            match render_breadcrumb_bar(ui, &self.current_vfs_dir) {
+                BreadcrumbAction::None => {}
+
+                BreadcrumbAction::Exit => {
+                    self.vault_reader = None;
+                    self.state = AppState::Home;
+                    return;
+                }
+
+                BreadcrumbAction::NavigateTo(path) => {
+                    self.current_vfs_dir = path;
+                    self.selected_file = None;
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            // 2. Дерево файлов через чистую функцию
+            match render_directory_tree(
+                ui,
+                &self.current_vfs_dir,
+                self.selected_file.as_ref(),
+                &entries,
+            ) {
+                DirectoryTreeAction::None => {}
+                DirectoryTreeAction::SelectFolder(dir) => {
+                    self.current_vfs_dir = dir;
+                    self.selected_file = None;
+                }
+                DirectoryTreeAction::SelectFile(file) => {
+                    self.selected_file = Some(file);
+                }
+                DirectoryTreeAction::ExecuteFile(file) => {
+                    if let Some(reader) = &mut self.vault_reader {
+                        let _ = reader.open_file_in_system(&file);
+                    }
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // 3. Панель детальной информации через чистую функцию
+            match render_file_details(ui, self.selected_file.as_ref()) {
+                FileDetailsAction::None => {}
+                FileDetailsAction::Open(entry) => {
+                    if let Some(reader) = &mut self.vault_reader {
+                        let _ = reader.open_file_in_system(&entry);
+                    }
+                }
+            }
+        });
     }
 
-    fn render_password_popup(&mut self, ctx: &egui::Context) {
+    fn handle_password_popup(&mut self, ctx: &egui::Context) {
         if !self.show_password_popup {
             return;
         }
 
-        // Контекст операции вычисляется на основе того, какой путь сейчас ожидает обработки
         let is_opening = self.pending_open_path.is_some();
+        let modal_result = PasswordModal::new(is_opening, &mut self.password_buffer).show(ctx);
 
-        let title = if is_opening { "🔐 Open EVFS Container" } else { "🔒 Create Encrypted Container" };
-        let label = if is_opening { "Enter password to decrypt container:" } else { "Enter password to encrypt container:" };
-        let btn_label = if is_opening { "🔓 Open" } else { "🔒 Encrypt" };
-
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(label);
-                    ui.add_space(6.0);
-
-                    let text_edit = egui::TextEdit::singleline(&mut self.password_buffer)
-                        .password(true)
-                        .desired_width(260.0);
-
-                    let response = ui.add(text_edit);
-
-                    if self.password_buffer.is_empty() && !response.has_focus() {
-                        response.request_focus();
-                    }
-
-                    ui.add_space(10.0);
-
-                    ui.horizontal(|ui| {
-                        let has_text = !self.password_buffer.is_empty();
-
-                        let enter_pressed = response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-                        if (ui.add_enabled(has_text, egui::Button::new(btn_label)).clicked() || enter_pressed)
-                            && has_text
-                        {
-                            if is_opening {
-                                self.submit_decryption_task();
-                            } else {
-                                self.submit_encryption_task();
-                            }
-                        }
-
-                        if ui.button("Cancel").clicked() {
-                            self.cancel_password_process();
-                        }
-                    });
-                });
-            });
-    }
-
-    fn submit_encryption_task(&mut self) {
-        if let (Some(dir), Some(save_path)) = (self.pending_directory.take(), self.pending_save_path.take()) {
-            self.show_password_popup = false;
-            self.progress = 0.0;
-            self.progress_message = "Creating container...".to_string();
-            self.operation_in_progress = true;
-            self.state = AppState::Loading;
-
-            let password_to_send = std::mem::take(&mut self.password_buffer);
-            self.create_container_async(dir, save_path, password_to_send);
+        match modal_result {
+            PasswordResult::None => {}
+            PasswordResult::Submit(password) => {
+                if is_opening {
+                    self.submit_decryption_task(password);
+                } else {
+                    self.submit_encryption_task(password);
+                }
+            }
+            PasswordResult::Cancel => {
+                self.cancel_password_process();
+            }
         }
     }
 
-    fn submit_decryption_task(&mut self) {
-        if let Some(file) = self.pending_open_path.take() {
-            self.show_password_popup = false;
-            self.progress = 0.0;
-            self.progress_message = "Opening vault...".to_string();
-            self.operation_in_progress = true;
-            self.state = AppState::Loading;
+    fn render_loading_popup(&mut self, ctx: &egui::Context) {
+        if self.operation_in_progress && self.state == AppState::Loading {
+            LoadingModal::new(self.progress, &self.progress_message).show(ctx);
+        }
+    }
 
-            let password_to_send = std::mem::take(&mut self.password_buffer);
+    // --- Фоновые бизнес-задачи ---
+    fn submit_encryption_task(&mut self, password: zeroize::Zeroizing<String>) {
+        if let (Some(dir), Some(save_path)) =
+            (self.pending_directory.take(), self.pending_save_path.take())
+        {
+            self.switch_to_loading("Creating container...");
+            self.create_container_async(dir, save_path, password.to_string());
+        }
+    }
+
+    fn submit_decryption_task(&mut self, password: zeroize::Zeroizing<String>) {
+        if let Some(file) = self.pending_open_path.take() {
+            self.switch_to_loading("Opening vault...");
             let tx = self.tx.clone().unwrap();
 
             std::thread::spawn(move || {
                 let _ = tx.send(ProgressMessage::StartLoading {
                     message: "Opening vault...".to_string(),
                 });
-
-                // Примечание: если VaultReader::open будет принимать пароль, передай сюда _password_to_send
-                match VaultReader::open(&file, password_to_send) {
+                match VaultReader::open(&file, password.to_string()) {
                     Ok(reader) => {
                         let _ = tx.send(ProgressMessage::DoneDecrypting { reader });
                     }
@@ -444,9 +418,8 @@ impl FileBrowserApp {
 
     fn create_container_async(&mut self, dir: PathBuf, save_path: PathBuf, password: String) {
         let tx = self.tx.clone().unwrap();
-
-        std::thread::spawn(move || {
-            match create_container(&dir, &save_path, &tx, password) {
+        std::thread::spawn(
+            move || match create_container(&dir, &save_path, &tx, password) {
                 Ok(_) => {
                     let _ = tx.send(ProgressMessage::DoneEncrypting);
                 }
@@ -455,241 +428,29 @@ impl FileBrowserApp {
                         error: format!("Error while creating EVFS: {}", err),
                     });
                 }
-            }
-        });
-    }
-
-    fn render_browser_screen(&mut self, ui: &mut egui::Ui) {
-        self.check_progress();
-
-        let vault_reader = match &mut self.vault_reader {
-            Some(r) => r,
-            None => {
-                self.state = AppState::Home;
-                return;
-            }
-        };
-
-        let entries = vault_reader.index.entries.clone();
-
-        egui::Frame::new().inner_margin(16).show(ui, |ui| {
-            self.render_navigation_bar(ui);
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(6.0);
-
-            let (sub_dirs, current_files) = self.categorize_entries(&entries);
-            self.render_file_list(ui, sub_dirs, current_files);
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            self.render_selected_file_info(ui);
-        });
-    }
-
-    fn render_navigation_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("📦").size(20.0));
-
-            if ui.small_button("Root").clicked() {
-                self.current_vfs_dir = String::new();
-                self.selected_file = None;
-            }
-
-            self.render_breadcrumb(ui);
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Exit").clicked() {
-                    self.vault_reader = None;
-                    self.state = AppState::Home;
-                }
-            });
-        });
-    }
-
-    fn render_breadcrumb(&mut self, ui: &mut egui::Ui) {
-        let dir = self.current_vfs_dir.clone();
-        let components: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
-
-        let mut accum = String::new();
-
-        for comp in components {
-            ui.label(egui::RichText::new("›").weak().size(16.0));
-            accum = if accum.is_empty() {
-                comp.to_string()
-            } else {
-                format!("{}/{}", accum, comp)
-            };
-
-            if ui.small_button(comp).clicked() {
-                self.current_vfs_dir = accum.clone();
-                self.selected_file = None;
-            }
-        }
-    }
-
-    fn categorize_entries(&self, entries: &[FileEntry]) -> (BTreeSet<String>, Vec<FileEntry>) {
-        let mut sub_dirs = BTreeSet::new();
-        let mut current_files = Vec::new();
-
-        for entry in entries {
-            let path = Path::new(&entry.path);
-
-            if self.is_entry_in_current_dir(path) {
-                current_files.push(entry.clone());
-            } else if let Some(dir) = self.get_subdirectory_from_path(path) {
-                sub_dirs.insert(dir);
-            }
-        }
-
-        (sub_dirs, current_files)
-    }
-
-    fn is_entry_in_current_dir(&self, path: &Path) -> bool {
-        if self.current_vfs_dir.is_empty() {
-            path.parent() == Some(Path::new(""))
-        } else {
-            path.starts_with(&self.current_vfs_dir)
-                && path.parent() == Some(Path::new(&self.current_vfs_dir))
-        }
-    }
-
-    fn get_subdirectory_from_path(&self, path: &Path) -> Option<String> {
-        let prefix = format!("{}/", self.current_vfs_dir);
-
-        if self.current_vfs_dir.is_empty() && path.components().count() > 1 {
-            return path
-                .components()
-                .next()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned());
-        }
-
-        if !self.current_vfs_dir.is_empty() && path.starts_with(&prefix) {
-            if let Ok(rel) = path.strip_prefix(&self.current_vfs_dir) {
-                if let Some(first_comp) = rel.components().next() {
-                    let comp_str = first_comp.as_os_str().to_string_lossy();
-                    if rel.components().count() > 1 {
-                        return Some(comp_str.into_owned());
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    fn render_file_list(
-        &mut self,
-        ui: &mut egui::Ui,
-        sub_dirs: BTreeSet<String>,
-        files: Vec<FileEntry>,
-    ) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for dir_name in sub_dirs {
-                    self.render_directory_item(ui, &dir_name);
-                }
-
-                for file_entry in files {
-                    self.render_file_item(ui, &file_entry);
-                }
-            });
-    }
-
-    fn render_directory_item(&mut self, ui: &mut egui::Ui, dir_name: &str) {
-        let resp = ui.selectable_label(false, format!("📁   {}", dir_name));
-        if resp.clicked() {
-            self.current_vfs_dir = if self.current_vfs_dir.is_empty() {
-                dir_name.to_string()
-            } else {
-                format!("{}/{}", self.current_vfs_dir, dir_name)
-            };
-            self.selected_file = None;
-        }
-    }
-
-    fn render_file_item(&mut self, ui: &mut egui::Ui, file_entry: &FileEntry) {
-        let file_name = Path::new(&file_entry.path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-
-        let is_selected = self.selected_file.as_ref().map(|f| f.offset) == Some(file_entry.offset);
-        let resp = ui.selectable_label(is_selected, format!("📄   {}", file_name));
-
-        if resp.clicked() {
-            self.selected_file = Some(file_entry.clone());
-        }
-
-        if resp.double_clicked() {
-            if let Some(reader) = &mut self.vault_reader {
-                let _ = reader.open_file_in_system(file_entry);
-            }
-        }
-    }
-
-    fn render_selected_file_info(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            if let Some(entry) = &self.selected_file {
-                self.render_file_details(ui, entry);
-                ui.add_space(8.0);
-
-                if ui
-                    .add_sized([180.0, 36.0], egui::Button::new("Open"))
-                    .clicked()
-                {
-                    if let Some(reader) = &mut self.vault_reader {
-                        let _ = reader.open_file_in_system(entry);
-                    }
-                }
-            } else {
-                ui.label(
-                    egui::RichText::new("The file is not selected")
-                        .italics()
-                        .weak(),
-                );
-            }
-        });
-    }
-
-    fn render_file_details(&self, ui: &mut egui::Ui, entry: &FileEntry) {
-        ui.label(
-            egui::RichText::new("Virtual file selected")
-                .strong()
-                .size(16.0),
+            },
         );
-        ui.label(egui::RichText::new(format!("Virtual file path: {}", entry.path)).small());
-        ui.label(
-            egui::RichText::new(format!("Offset: {}", entry.offset))
-                .monospace()
-                .small(),
-        );
-        ui.label(
-            egui::RichText::new(format!(
-                "Size: {} byte (Compressed: {} byte)",
-                entry.original_size, entry.stored_size
-            ))
-            .small(),
-        );
+    }
+
+    fn switch_to_loading(&mut self, message: &str) {
+        self.show_password_popup = false;
+        self.progress = 0.0;
+        self.progress_message = message.to_string();
+        self.operation_in_progress = true;
+        self.state = AppState::Loading;
     }
 }
 
 impl eframe::App for FileBrowserApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.initialize_style(ui.ctx());
-
         self.background.update_and_draw(ui);
 
-        self.render_custom_title_bar(ui);
+        CustomTitleBar::show(ui);
         ui.add_space(10.0);
 
         if self.rx.is_some() {
             self.check_progress();
-
             if self.operation_in_progress {
                 ui.ctx().request_repaint();
             }
@@ -697,8 +458,12 @@ impl eframe::App for FileBrowserApp {
 
         match self.state {
             AppState::Home => self.render_home_screen(ui),
-            AppState::Loading => self.render_loading_popup(ui.ctx()),
             AppState::Browser => self.render_browser_screen(ui),
+            AppState::Loading => {
+                // Если мы в стейте Loading, рисуем базовый домашний экран
+                // как подложку, а поверх него вызовется модалка загрузки
+                self.render_home_screen(ui);
+            }
         }
     }
 }

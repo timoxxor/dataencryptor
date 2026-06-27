@@ -36,6 +36,7 @@ mod deflate;
 mod gui;
 mod particles;
 mod gif_player;
+mod ui;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
