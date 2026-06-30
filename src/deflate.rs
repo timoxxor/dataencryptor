@@ -3,9 +3,9 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
@@ -137,14 +137,27 @@ impl BufferPool {
 }
 
 pub struct VaultReader {
-    pub file: BufReader<File>,
+    pub file: Option<BufReader<File>>,
     pub index: ContainerIndex,
     pub hkdf: HkdfContext,
+    pub salt: [u8; 16],
+    pub container_path: PathBuf,
 }
 
 impl VaultReader {
+    fn file_mut(&mut self) -> &mut BufReader<File> {
+        self.file.as_mut().expect("VaultReader file is closed")
+    }
+
+    fn file_ref(&self) -> &BufReader<File> {
+        self.file.as_ref().expect("VaultReader file is closed")
+    }
+
     pub fn open(pack_path: &Path, password: &str) -> io::Result<Self> {
-        let raw = File::open(pack_path)?;
+        let raw = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pack_path)?;
         let mut file = BufReader::new(raw);
 
         let header: Header = bincode::deserialize_from(&mut file)
@@ -177,7 +190,13 @@ impl VaultReader {
         let index: ContainerIndex = bincode::deserialize(&index_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        Ok(Self { file, index, hkdf })
+        Ok(Self {
+            file: Some(file),
+            index,
+            hkdf,
+            salt,
+            container_path: pack_path.to_path_buf(),
+        })
     }
 
     pub fn extract_file<W: Write>(&mut self, entry: &FileEntry, mut writer: W) -> io::Result<()> {
@@ -186,9 +205,10 @@ impl VaultReader {
             .derive(&entry.id)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "File HKDF derive failed"))?;
 
-        self.file.seek(SeekFrom::Start(entry.offset))?;
+        let file = self.file_mut();
+        file.seek(SeekFrom::Start(entry.offset))?;
 
-        let limited = (&mut self.file).take(entry.stored_size);
+        let limited = file.take(entry.stored_size);
         let mut reader = ChunkDecryptReader::new(limited, &file_key, Some(entry.id))?;
 
         if entry.compressed {
@@ -205,6 +225,200 @@ impl VaultReader {
         let mut data = Vec::with_capacity(entry.original_size as usize);
         self.extract_file(entry, &mut data)?;
         Ok(data)
+    }
+
+    pub fn update_entry(&mut self, entry: &FileEntry, new_data: &[u8]) -> io::Result<FileEntry> {
+        let file_key = self
+            .hkdf
+            .derive(&entry.id)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "File HKDF derive failed"))?;
+
+        let compressed = should_compress(Path::new(&entry.path), new_data.len() as u64);
+        let original_size = new_data.len() as u64;
+
+        let encrypted = if compressed {
+            let ew = ChunkEncryptWriter::new(Vec::new(), &file_key, Some(entry.id))?;
+            let mut encoder = DeflateEncoder::new(ew, Compression::new(3));
+            encoder.write_all(new_data)?;
+            encoder
+                .finish()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                .finish()?
+        } else {
+            let mut ew = ChunkEncryptWriter::new(Vec::new(), &file_key, Some(entry.id))?;
+            ew.write_all(new_data)?;
+            ew.finish()?
+        };
+
+        let stored_size = encrypted.len() as u64;
+
+        let offset;
+        {
+            let file = self.file_mut();
+            let inner = file.get_mut();
+            inner.seek(SeekFrom::End(0))?;
+            offset = inner.stream_position()?;
+            inner.write_all(&encrypted)?;
+        }
+
+        if let Some(existing) = self.index.entries.iter_mut().find(|e| e.path == entry.path) {
+            existing.offset = offset;
+            existing.stored_size = stored_size;
+            existing.original_size = original_size;
+            existing.compressed = compressed;
+        }
+
+        let index_bytes = bincode::serialize(&self.index)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let compressed_index = compress(&index_bytes, Vec::new())?;
+
+        let index_key = self
+            .hkdf
+            .derive(b"index_key")
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "HKDF index key derivation failed"))?;
+
+        let mut ew = ChunkEncryptWriter::new(Vec::new(), &index_key, None)?;
+        ew.write_all(&compressed_index)?;
+        let encrypted_index = ew.finish()?;
+        let index_size = encrypted_index.len() as u64;
+
+        let salt = self.salt;
+        {
+            let file = self.file_mut();
+            let inner = file.get_mut();
+            let new_index_offset = inner.stream_position()?;
+            inner.write_all(&encrypted_index)?;
+
+            let final_header = Header {
+                magic: *MAGIC,
+                version: FORMAT_VERSION,
+                salt,
+                index_offset: new_index_offset,
+                index_size,
+            };
+            let final_header_bytes =
+                bincode::serialize(&final_header).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+            inner.seek(SeekFrom::Start(0))?;
+            inner.write_all(&final_header_bytes)?;
+            inner.flush()?;
+        }
+
+        Ok(FileEntry {
+            id: entry.id,
+            path: entry.path.clone(),
+            offset,
+            stored_size,
+            original_size,
+            compressed,
+        })
+    }
+
+    pub fn garbage_collect(&mut self) -> io::Result<bool> {
+        let file_size = {
+            let file = self.file_ref();
+            file.get_ref().metadata()?.len()
+        };
+
+        let saved_pos = {
+            let file = self.file_mut();
+            let pos = file.stream_position()?;
+            file.seek(SeekFrom::Start(0))?;
+            pos
+        };
+        let header: Header = {
+            let file = self.file_mut();
+            bincode::deserialize_from(&mut *file)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        };
+        {
+            let file = self.file_mut();
+            file.seek(SeekFrom::Start(saved_pos))?;
+        }
+
+        const HEADER_SIZE: u64 = 37;
+        let useful_data: u64 = self.index.entries.iter().map(|e| e.stored_size).sum();
+        let logical_size = HEADER_SIZE + useful_data + header.index_size;
+        let garbage = file_size.saturating_sub(logical_size);
+
+        if garbage == 0 || (garbage as f64 / file_size as f64) <= 0.1 {
+            return Ok(false);
+        }
+
+        let temp_path = self.container_path.with_extension("enc.gc");
+        let raw = File::create(&temp_path)?;
+        let mut writer = BufWriter::new(raw);
+
+        let header_bytes = bincode::serialize(&Header::new(&self.salt))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        writer.write_all(&header_bytes)?;
+
+        let entries_snapshot = self.index.entries.clone();
+        let mut new_entries: Vec<FileEntry> = Vec::with_capacity(entries_snapshot.len());
+        for entry in &entries_snapshot {
+            let new_offset = writer.stream_position()?;
+
+            let mut encrypted = vec![0u8; entry.stored_size as usize];
+            {
+                let file = self.file_mut();
+                file.seek(SeekFrom::Start(entry.offset))?;
+                file.read_exact(&mut encrypted)?;
+            }
+
+            writer.write_all(&encrypted)?;
+
+            new_entries.push(FileEntry {
+                offset: new_offset,
+                ..entry.clone()
+            });
+        }
+
+        let new_index_offset = writer.stream_position()?;
+        let index_data = ContainerIndex {
+            entries: new_entries,
+        };
+        let index_bytes =
+            bincode::serialize(&index_data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let compressed_index = compress(&index_bytes, Vec::new())?;
+
+        let index_key = self
+            .hkdf
+            .derive(b"index_key")
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "HKDF index key derivation failed"))?;
+
+        let mut ew = ChunkEncryptWriter::new(Vec::new(), &index_key, None)?;
+        ew.write_all(&compressed_index)?;
+        let encrypted_index = ew.finish()?;
+        let new_index_size = encrypted_index.len() as u64;
+
+        writer.write_all(&encrypted_index)?;
+
+        let final_header = Header {
+            magic: *MAGIC,
+            version: FORMAT_VERSION,
+            salt: self.salt,
+            index_offset: new_index_offset,
+            index_size: new_index_size,
+        };
+        let final_header_bytes =
+            bincode::serialize(&final_header).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        writer.seek(SeekFrom::Start(0))?;
+        writer.write_all(&final_header_bytes)?;
+        writer.flush()?;
+        drop(writer);
+
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.container_path);
+        std::fs::rename(&temp_path, &self.container_path)?;
+
+        let new_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.container_path)?;
+        self.file = Some(BufReader::new(new_file));
+        self.index = index_data;
+
+        Ok(true)
     }
 }
 

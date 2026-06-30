@@ -127,6 +127,19 @@ impl FileBrowserApp {
                     WorkerResponse::FileDecryptedToTemp { temp_path } => {
                         let _ = opener::open(&temp_path);
                     }
+                    WorkerResponse::FileUpdated { entry } => {
+                        if let Some(ref mut index) = self.container_index {
+                            if let Some(existing) =
+                                index.entries.iter_mut().find(|e| e.path == entry.path)
+                            {
+                                *existing = entry;
+                            }
+                        }
+                    }
+                    WorkerResponse::GarbageCollected => {
+                        self.toast_manager
+                            .info("Vault garbage collected successfully");
+                    }
                     WorkerResponse::Error { message } => {
                         if message != "Cancelled" {
                             self.toast_manager.error(message);

@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, SystemTime};
 use zeroize::Zeroizing;
 
 use crate::deflate::{ContainerIndex, FileEntry, VaultReader, create_container};
@@ -19,6 +22,7 @@ pub enum WorkerCommand {
         password: Zeroizing<String>,
         progress_tx: mpsc::Sender<ProgressMessage>,
     },
+    GarbageCollect,
     CloseVault,
 }
 
@@ -29,6 +33,10 @@ pub enum WorkerResponse {
     FileDecryptedToTemp {
         temp_path: PathBuf,
     },
+    FileUpdated {
+        entry: FileEntry,
+    },
+    GarbageCollected,
     EncryptionDone,
     Error {
         message: String,
@@ -43,8 +51,63 @@ pub fn spawn() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResponse>) 
         .name("vault-worker".into())
         .spawn(move || {
             let mut vault: Option<VaultReader> = None;
+            let mut watched_files: HashMap<PathBuf, (FileEntry, SystemTime)> = HashMap::new();
+            let poll_interval = Duration::from_secs(2);
 
-            while let Ok(cmd) = cmd_rx.recv() {
+            loop {
+                let cmd = match cmd_rx.recv_timeout(poll_interval) {
+                    Ok(cmd) => cmd,
+                    Err(RecvTimeoutError::Timeout) => {
+                        let changed: Vec<_> = watched_files
+                            .iter()
+                            .filter_map(|(path, (entry, last_mod))| {
+                                std::fs::metadata(path)
+                                    .ok()
+                                    .and_then(|m| m.modified().ok())
+                                    .filter(|&m| m > *last_mod)
+                                    .map(|m| (path.clone(), entry.clone(), m))
+                            })
+                            .collect();
+
+                        for (temp_path, entry, new_mod) in changed {
+                            if let Some(ref mut reader) = vault {
+                                match std::fs::read(&temp_path) {
+                                    Ok(new_data) => {
+                                        match reader.update_entry(&entry, &new_data) {
+                                            Ok(new_entry) => {
+                                                watched_files
+                                                    .insert(temp_path, (entry, new_mod));
+                                                let _ = resp_tx
+                                                    .send(WorkerResponse::FileUpdated {
+                                                        entry: new_entry,
+                                                    });
+                                            }
+                                            Err(e) => {
+                                                let _ = resp_tx.send(WorkerResponse::Error {
+                                                    message: format!(
+                                                        "Failed to update file: {}",
+                                                        e
+                                                    ),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = resp_tx.send(WorkerResponse::Error {
+                                            message: format!(
+                                                "Failed to read updated temp file: {}",
+                                                e
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
+
                 let result = match cmd {
                     WorkerCommand::OpenVault { path, password } => {
                         match VaultReader::open(&path, &password) {
@@ -67,11 +130,20 @@ pub fn spawn() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResponse>) 
                         match vault.as_mut() {
                             Some(reader) => match reader.read_file_content(&entry) {
                                 Ok(bytes) => {
-                                    let temp = std::env::temp_dir().join(format!("evfs_{}", name));
+                                    let temp =
+                                        std::env::temp_dir().join(format!("evfs_{}", name));
                                     match std::fs::write(&temp, &bytes) {
-                                        Ok(_) => WorkerResponse::FileDecryptedToTemp {
-                                            temp_path: temp,
-                                        },
+                                        Ok(_) => {
+                                            if let Ok(meta) = std::fs::metadata(&temp) {
+                                                if let Ok(modified) = meta.modified() {
+                                                    watched_files.insert(
+                                                        temp.clone(),
+                                                        (entry, modified),
+                                                    );
+                                                }
+                                            }
+                                            WorkerResponse::FileDecryptedToTemp { temp_path: temp }
+                                        }
                                         Err(e) => WorkerResponse::Error {
                                             message: format!("Failed to write temp file: {}", e),
                                         },
@@ -91,14 +163,37 @@ pub fn spawn() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResponse>) 
                         output_path,
                         password,
                         progress_tx,
-                    } => match create_container(&source_dir, &output_path, &progress_tx, &password) {
-                        Ok(_) => WorkerResponse::EncryptionDone,
-                        Err(e) => WorkerResponse::Error {
-                            message: format!("Encryption failed: {}", e),
-                        },
-                    },
+                    } => {
+                        match create_container(&source_dir, &output_path, &progress_tx, &password)
+                        {
+                            Ok(_) => WorkerResponse::EncryptionDone,
+                            Err(e) => WorkerResponse::Error {
+                                message: format!("Encryption failed: {}", e),
+                            },
+                        }
+                    }
+                    WorkerCommand::GarbageCollect => {
+                        match vault.as_mut() {
+                            Some(reader) => match reader.garbage_collect() {
+                                Ok(true) => WorkerResponse::GarbageCollected,
+                                Ok(false) => WorkerResponse::Error {
+                                    message: "Garbage is below 10% threshold, no collection needed".into(),
+                                },
+                                Err(e) => WorkerResponse::Error {
+                                    message: format!("Garbage collection failed: {}", e),
+                                },
+                            },
+                            None => WorkerResponse::Error {
+                                message: "No vault is open".into(),
+                            },
+                        }
+                    }
                     WorkerCommand::CloseVault => {
+                        if let Some(ref mut reader) = vault {
+                            let _ = reader.garbage_collect();
+                        }
                         vault = None;
+                        watched_files.clear();
                         continue;
                     }
                 };

@@ -114,7 +114,7 @@ impl ToastManager {
                     Frame::new()
                         .fill(bg)
                         .corner_radius(CornerRadius::same(6))
-                        .stroke(Stroke::new(1.0, border))
+                        .stroke(Stroke::new(1.0_f32, border))
                         .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
