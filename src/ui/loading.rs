@@ -14,7 +14,7 @@ impl<'a> LoadingModal<'a> {
         Window::new("⏳ Processing")
             .resizable(false)
             .collapsible(false)
-            .movable(false)
+            .movable(true)
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);

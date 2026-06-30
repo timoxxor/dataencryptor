@@ -1,11 +1,7 @@
 use egui::{Button, Context, Key, TextEdit, Window};
 use zeroize::{Zeroize, Zeroizing};
 
-pub enum PasswordResult {
-    None,
-    Submit(Zeroizing<String>),
-    Cancel,
-}
+use super::event::PasswordEvent;
 
 pub struct PasswordModal<'a> {
     is_opening: bool,
@@ -23,8 +19,8 @@ impl<'a> PasswordModal<'a> {
         }
     }
 
-    pub fn show(self, ctx: &Context) -> PasswordResult {
-        let mut result = PasswordResult::None;
+    pub fn show(self, ctx: &Context) -> Option<PasswordEvent> {
+        let mut result = None;
 
         let title = if self.is_opening {
             "🔐 Enter Password to Decrypt"
@@ -65,9 +61,8 @@ impl<'a> PasswordModal<'a> {
                             .clicked()
                         {
                             self.password_buffer.zeroize();
-                            self.password_buffer.clear();
 
-                            result = PasswordResult::Cancel;
+                            result = Some(PasswordEvent::Cancelled);
                             return;
                         }
 
@@ -78,23 +73,21 @@ impl<'a> PasswordModal<'a> {
                                 || ui.input(|i| i.key_pressed(Key::Enter));
 
                         if submit && !self.password_buffer.is_empty() {
-                            // Забираем строку БЕЗ clone().
                             let password = std::mem::take(self.password_buffer);
 
-                            // На месте старой строки остается пустая.
-                            result = PasswordResult::Submit(
+                            result = Some(PasswordEvent::Submitted(
                                 Zeroizing::new(password),
-                            );
+                            ));
                         }
                     });
                 });
             });
 
-        if !open && matches!(result, PasswordResult::None) {
+        if !open && result.is_none() {
             self.password_buffer.zeroize();
             self.password_buffer.clear();
 
-            return PasswordResult::Cancel;
+            return Some(PasswordEvent::Cancelled);
         }
 
         result

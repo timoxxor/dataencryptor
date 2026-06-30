@@ -1,29 +1,23 @@
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
-use image::EncodableLayout;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
-//use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::sync_channel;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-use crate::crypto::{self, Aes, hkdf_derive};
-use crate::gui;
+use crate::crypto::{self, ChunkDecryptReader, ChunkEncryptWriter, HkdfContext};
+use crate::ui::ProgressMessage;
 
 pub const MAGIC: &[u8; 4] = b"EVFS";
-pub const FORMAT_VERSION: u8 = 1;
+pub const FORMAT_VERSION: u8 = 2;
 pub const MIN_COMPRESS_SIZE: u64 = 256;
-
-#[derive(Default)]
-pub enum CompressionRequirements {
-    Required,
-    #[default]
-    None,
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Header {
@@ -53,15 +47,16 @@ pub struct FileEntry {
     pub offset: u64,
     pub stored_size: u64,
     pub original_size: u64,
+    pub compressed: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ContainerIndex {
     pub entries: Vec<FileEntry>,
 }
 
 pub fn compress<W: Write>(data: &[u8], writer: W) -> io::Result<W> {
-    let mut encoder = DeflateEncoder::new(writer, Compression::default());
+    let mut encoder = DeflateEncoder::new(writer, Compression::new(3));
     encoder.write_all(data)?;
 
     encoder
@@ -75,42 +70,70 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(decompressed)
 }
 
-pub fn write_compressed_to_file<W: Write + Seek>(
-    data: &[u8],
-    uuid: [u8; 16],
-    salt: &[u8; 16],
-    ikm: &[u8],
-    c_req: CompressionRequirements,
-    writer: &mut W,
-) -> io::Result<u64> {
-    let start_pos = writer.stream_position()?;
-    let output = match c_req {
-        CompressionRequirements::Required => compress(data, Vec::new())?,
-        CompressionRequirements::None => data.to_vec(),
-    };
+fn should_compress(path: &Path, file_size: u64) -> bool {
+    if file_size < MIN_COMPRESS_SIZE {
+        return false;
+    }
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico" | "heic" | "avif") => false,
+        Some("mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v") => false,
+        Some("mp3" | "flac" | "wav" | "aac" | "ogg" | "wma" | "m4a") => false,
+        Some("zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst") => false,
+        Some("pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx") => false,
+        _ => true,
+    }
+}
 
-    let key = crypto::hkdf_derive(Some(salt), &uuid, ikm)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "hkdf derive failed"))?;
-    let alg = Aes::new(key.to_vec(), None);
-    let encrypted = alg
-        .encrypt(&output)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "aes encryption failed"))?;
+struct FileWork {
+    data: Vec<u8>,
+    id: [u8; 16],
+    path: String,
+    original_size: u64,
+    compressed: bool,
+}
 
-    writer.write_all(&encrypted)?;
-    let end_pos = writer.stream_position()?;
-    Ok(end_pos - start_pos)
+struct BufferPool {
+    inner: Mutex<Vec<Vec<u8>>>,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self { inner: Mutex::new(Vec::new()) }
+    }
+
+    fn acquire(&self, capacity: usize) -> Vec<u8> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .pop()
+            .map(|mut v| {
+                v.clear();
+                v.reserve(capacity);
+                v
+            })
+            .unwrap_or_else(|| Vec::with_capacity(capacity))
+    }
+
+    fn release(&self, buf: Vec<u8>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.push(buf);
+    }
 }
 
 pub struct VaultReader {
-    pub file: File,
+    pub file: BufReader<File>,
     pub index: ContainerIndex,
-    pub master_key: Vec<u8>,
-    pub salt: [u8; 16]
+    pub hkdf: HkdfContext,
 }
 
 impl VaultReader {
-    pub fn open(pack_path: &Path, mut password: String) -> io::Result<Self> {
-        let mut file = File::open(pack_path)?;
+    pub fn open(pack_path: &Path, password: &str) -> io::Result<Self> {
+        let raw = File::open(pack_path)?;
+        let mut file = BufReader::new(raw);
 
         let header: Header = bincode::deserialize_from(&mut file)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -121,101 +144,70 @@ impl VaultReader {
 
         let salt = header.salt;
 
+        let master_key = crypto::argon2id(password.as_bytes(), salt)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Argon2id kdf failed"))?;
+        let hkdf = HkdfContext::new(&salt, &master_key);
+
+        let index_key = hkdf
+            .derive(b"index_key")
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hkdf derive failed"))?;
+
         file.seek(SeekFrom::Start(header.index_offset))?;
         let mut encrypted_index = vec![0u8; header.index_size as usize];
         file.read_exact(&mut encrypted_index)?;
 
-        let master_key = crypto::argon2id(password.as_bytes(), salt)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "Argon2id kdf failed"))?;
-        password.zeroize();
-
-        let key = crypto::hkdf_derive(Some(&salt), b"index_key", &master_key)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hkdf derive failed"))?;
-        let alg = Aes::new(key.to_vec(), None);
-        let decrypted_index = alg
-            .decrypt(&encrypted_index)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "aes decryption failed"))?;
+        let cursor = std::io::Cursor::new(encrypted_index);
+        let mut reader = ChunkDecryptReader::new(cursor, &index_key, None)?;
+        let mut decrypted_index = Vec::new();
+        reader.read_to_end(&mut decrypted_index)?;
 
         let index_bytes = decompress(&decrypted_index)?;
         let index: ContainerIndex = bincode::deserialize(&index_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        // let mut offset_map = HashMap::new();
-        // for (i, entry) in index.entries.iter().enumerate() {
-        //     offset_map.insert(entry.offset, i);
-        // }
+        Ok(Self { file, index, hkdf })
+    }
 
-        Ok(Self {
-            file,
-            index,
-            master_key, 
-            salt
-            //offset_map,
-        })
+    pub fn extract_file<W: Write>(&mut self, entry: &FileEntry, mut writer: W) -> io::Result<()> {
+        let file_key = self
+            .hkdf
+            .derive(&entry.id)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "File HKDF derive failed"))?;
+
+        self.file.seek(SeekFrom::Start(entry.offset))?;
+
+        let limited = (&mut self.file).take(entry.stored_size);
+        let mut reader = ChunkDecryptReader::new(limited, &file_key, Some(entry.id))?;
+
+        if entry.compressed {
+            let mut decoder = DeflateDecoder::new(reader);
+            io::copy(&mut decoder, &mut writer)?;
+        } else {
+            io::copy(&mut reader, &mut writer)?;
+        }
+
+        Ok(())
     }
 
     pub fn read_file_content(&mut self, entry: &FileEntry) -> io::Result<Vec<u8>> {
-        // 1. Читаем зашифрованные (и возможно сжатые) данные из файла контейнера
-        self.file.seek(SeekFrom::Start(entry.offset))?;
-        let mut encrypted_data = vec![0u8; entry.stored_size as usize];
-        self.file.read_exact(&mut encrypted_data)?;
-
-        // 2. Деривация уникального ключа для конкретного файла (точно так же, как при записи)
-        // Используем master_key.as_bytes() или прямо &*self.master_key в зависимости от вашего крипто-модуля
-        let file_key = crypto::hkdf_derive(
-            Some(&self.salt),
-            &entry.id,
-            self.master_key.as_bytes(), // или как вы передавали в write_compressed_to_file
-        )
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "File HKDF derive failed"))?;
-
-        // 3. Расшифровка AES
-        let alg = Aes::new(file_key.to_vec(), None);
-        let decrypted_data = alg
-            .decrypt(&encrypted_data)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "File AES decryption failed"))?;
-
-        if decrypted_data.len() as u64 == entry.original_size {
-            Ok(decrypted_data)
-        } else {
-            decompress(&decrypted_data)
-        }
-    }
-
-    pub fn open_file_in_system(&mut self, entry: &FileEntry) -> io::Result<()> {
-        let name = Path::new(&entry.path)
-            .file_name()
-            .unwrap()
-            .to_string_lossy();
-        let temp = std::env::temp_dir().join(format!("evfs_{}", name));
-
-        let bytes = self.read_file_content(entry)?;
-        fs::write(&temp, bytes)?;
-
-        opener::open(&temp).map_err(io::Error::other)?;
-        Ok(())
+        let mut data = Vec::with_capacity(entry.original_size as usize);
+        self.extract_file(entry, &mut data)?;
+        Ok(data)
     }
 }
 
 pub fn create_container(
     source_dir: &Path,
     output_pack: &Path,
-    tx: &std::sync::mpsc::Sender<gui::ProgressMessage>,
-    mut password: String,
+    tx: &std::sync::mpsc::Sender<ProgressMessage>,
+    password: &str,
 ) -> io::Result<()> {
     let salt = crypto::rand_salt();
 
     let master_key = crypto::argon2id(password.as_bytes(), salt)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "Argon2id kdf failed"))?;
-    password.zeroize();
+    let hkdf = HkdfContext::new(&salt, &master_key);
 
-    let mut pack_file = File::create(output_pack)?;
-
-    let header_bytes = bincode::serialize(&Header::new(&salt))
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    pack_file.write_all(&header_bytes)?;
-
-    let mut entries = Vec::new();
     let walker: Vec<_> = WalkDir::new(source_dir)
         .min_depth(1)
         .into_iter()
@@ -225,64 +217,132 @@ pub fn create_container(
 
     let total_files = walker.len();
 
-    for (i, entry) in walker.iter().enumerate() {
-        let relative_path = entry
-            .path()
+    let _ = tx.send(ProgressMessage::Progress {
+        current: 0,
+        total: total_files,
+        message: "Processing files...".into(),
+    });
+
+    let (work_tx, work_rx) = sync_channel::<FileWork>(total_files.min(8).max(1));
+    let pool = Arc::new(BufferPool::new());
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let writer_thread = {
+        let output_pack = output_pack.to_path_buf();
+        let tx = tx.clone();
+        let pool = Arc::clone(&pool);
+        std::thread::Builder::new()
+            .name("vault-writer".into())
+            .spawn(move || -> io::Result<(BufWriter<File>, Vec<FileEntry>)> {
+                let raw = File::create(&output_pack)?;
+                let mut pack_file = BufWriter::new(raw);
+
+                let header_bytes = bincode::serialize(&Header::new(&salt))
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                pack_file.write_all(&header_bytes)?;
+
+                let mut entries = Vec::with_capacity(total_files);
+
+                for _ in 0..total_files {
+                    let work = match work_rx.recv() {
+                        Ok(w) => w,
+                        Err(_) => break,
+                    };
+
+                    let offset = pack_file.stream_position()?;
+                    pack_file.write_all(&work.data)?;
+                    let stored_size = work.data.len() as u64;
+
+                    entries.push(FileEntry {
+                        id: work.id,
+                        path: work.path,
+                        offset,
+                        stored_size,
+                        original_size: work.original_size,
+                        compressed: work.compressed,
+                    });
+
+                    let _ = tx.send(ProgressMessage::Progress {
+                        current: entries.len(),
+                        total: total_files,
+                        message: format!("Writing file: {}", entries.last().unwrap().path),
+                    });
+
+                    pool.release(work.data);
+                }
+
+                Ok((pack_file, entries))
+            })
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+    };
+
+    walker.par_iter().try_for_each(|entry| -> io::Result<()> {
+        let full_path = entry.path();
+        let relative_path = full_path
             .strip_prefix(source_dir)
             .unwrap()
             .to_string_lossy()
             .into_owned();
 
-        let mut raw_data = Vec::new();
-        File::open(entry.path())?.read_to_end(&mut raw_data)?;
-
-        let original_size = raw_data.len() as u64;
-        let offset = pack_file.stream_position()?;
-        let size;
+        let file_size = std::fs::metadata(full_path)?.len();
         let uuid = Uuid::new_v4().to_bytes_le();
+        let compressed = should_compress(full_path, file_size);
 
-        let c_req = (original_size >= MIN_COMPRESS_SIZE)
-            .then_some(CompressionRequirements::Required)
-            .unwrap_or_default();
+        let file_key = hkdf
+            .derive(&uuid)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hkdf derive failed"))?;
 
-        size = write_compressed_to_file(
-            &raw_data,
-            uuid,
-            &salt,
-            master_key.as_bytes(),
-            c_req,
-            &mut pack_file,
-        )?;
+        let _cur = counter.fetch_add(1, Ordering::SeqCst) + 1;
 
-        entries.push(FileEntry {
+        let inner = pool.acquire(file_size as usize);
+        let ew = ChunkEncryptWriter::new(inner, &file_key, Some(uuid))?;
+
+        let mut file = File::open(full_path)?;
+        let data = if compressed {
+            let mut encoder = DeflateEncoder::new(ew, Compression::new(3));
+            io::copy(&mut file, &mut encoder)?;
+            encoder
+                .finish()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                .finish()?
+        } else {
+            let mut ew = ew;
+            io::copy(&mut file, &mut ew)?;
+            ew.finish()?
+        };
+
+        let _ = work_tx.send(FileWork {
+            data,
             id: uuid,
             path: relative_path,
-            offset,
-            stored_size: size,
-            original_size,
+            original_size: file_size,
+            compressed,
         });
 
-        let _ = tx.send(gui::ProgressMessage::Progress {
-            current: i + 1,
-            total: total_files,
-            message: format!("Processing file: {}", entry.file_name().to_string_lossy()),
-        });
-    }
+        Ok(())
+    })?;
+
+    drop(work_tx);
+
+    let (mut pack_file, entries) = writer_thread
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "writer thread panicked"))??;
 
     let index_offset = pack_file.stream_position()?;
     let index_data = ContainerIndex { entries };
     let index_bytes =
         bincode::serialize(&index_data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    drop(index_data);
 
     let compressed_index = compress(&index_bytes, Vec::new())?;
 
-    let index_key = hkdf_derive(Some(&salt), b"index_key", &master_key)
+    let index_key = hkdf
+        .derive(b"index_key")
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "HKDF index key derivation failed"))?;
 
-    let alg = Aes::new(index_key.to_vec(), None);
-    let encrypted_index = alg
-        .encrypt(&compressed_index)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "aes encryption failed"))?;
+    let mut ew = ChunkEncryptWriter::new(Vec::new(), &index_key, None)?;
+    ew.write_all(&compressed_index)?;
+    let encrypted_index = ew.finish()?;
 
     pack_file.write_all(&encrypted_index)?;
     let index_size = encrypted_index.len() as u64;
@@ -299,6 +359,7 @@ pub fn create_container(
 
     pack_file.seek(SeekFrom::Start(0))?;
     pack_file.write_all(&final_header_bytes)?;
+    pack_file.flush()?;
 
     println!("Контейнер успешно создан: {:?}", output_pack);
     Ok(())

@@ -969,6 +969,7 @@ dependencies = [
  "image",
  "opener",
  "rand 0.10.1",
+ "rayon",
  "rfd",
  "ring",
  "serde",

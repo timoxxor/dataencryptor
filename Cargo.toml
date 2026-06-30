@@ -20,3 +20,4 @@ image = { version = "0.25.10", features = ["gif"] }
 uuid = {version = "1.23.4", features = ["v4"]}
 zeroize = "1.9.0"
 argon2 = "0.5.3"
+rayon = "1"
