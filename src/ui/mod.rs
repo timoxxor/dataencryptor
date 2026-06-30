@@ -6,6 +6,7 @@ pub mod loading;
 pub mod password;
 pub mod state;
 pub mod title_bar;
+pub mod toast;
 
 pub use browser_screen::BrowserScreen;
 pub use event::{AppEvent, BrowserEvent, HomeEvent, PasswordEvent};
@@ -14,3 +15,4 @@ pub use loading::LoadingModal;
 pub use password::PasswordModal;
 pub use state::{AppState, ProgressMessage};
 pub use title_bar::CustomTitleBar;
+pub use toast::ToastManager;

@@ -9,7 +9,7 @@ use crate::worker::{WorkerCommand, WorkerResponse};
 
 use crate::ui::{
     AppEvent, AppState, BrowserEvent, BrowserScreen, CustomTitleBar, HomeEvent, HomeScreen,
-    LoadingModal, PasswordEvent, PasswordModal, ProgressMessage,
+    LoadingModal, PasswordEvent, PasswordModal, ProgressMessage, ToastManager,
 };
 
 pub struct FileBrowserApp {
@@ -31,10 +31,10 @@ pub struct FileBrowserApp {
 
     pub rx: Option<mpsc::Receiver<ProgressMessage>>,
     pub tx: Option<mpsc::Sender<ProgressMessage>>,
-    pub operation_result: Option<String>,
 
     pub background: particles::ParticleBackground,
     pub gif_player: Option<GifPlayer>,
+    pub toast_manager: ToastManager,
 }
 
 impl FileBrowserApp {
@@ -56,9 +56,9 @@ impl FileBrowserApp {
             progress_message: String::new(),
             rx: None,
             tx: None,
-            operation_result: None,
             background: particles::ParticleBackground::default(),
             gif_player: Some(GifPlayer::new(ctx, "assets/title.gif")),
+            toast_manager: ToastManager::new(),
         }
     }
 
@@ -115,19 +115,21 @@ impl FileBrowserApp {
                         self.tx = None;
                         self.progress = 0.0;
                         self.progress_message = String::new();
+                        self.toast_manager.info("Vault opened successfully");
                     }
                     WorkerResponse::EncryptionDone => {
                         self.state = AppState::Home;
                         self.tx = None;
                         self.progress = 0.0;
                         self.progress_message = String::new();
+                        self.toast_manager.info("Encryption completed successfully");
                     }
                     WorkerResponse::FileDecryptedToTemp { temp_path } => {
                         let _ = opener::open(&temp_path);
                     }
                     WorkerResponse::Error { message } => {
                         if message != "Cancelled" {
-                            self.operation_result = Some(format!("Error: {}", message));
+                            self.toast_manager.error(message);
                         }
                         self.state = AppState::Home;
                         self.tx = None;
@@ -276,6 +278,7 @@ impl eframe::App for FileBrowserApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_style(ui.ctx());
         self.background.update_and_draw(ui);
+        self.toast_manager.show(ui.ctx());
 
         CustomTitleBar::show(ui);
         ui.add_space(10.0);
@@ -289,7 +292,6 @@ impl eframe::App for FileBrowserApp {
             AppState::Home => {
                 let home = HomeScreen {
                     gif_player: &mut self.gif_player,
-                    operation_result: &self.operation_result,
                     state: &self.state,
                 };
                 if let Some(event) = home.show(ui) {
@@ -320,7 +322,6 @@ impl eframe::App for FileBrowserApp {
             AppState::Loading => {
                 let home = HomeScreen {
                     gif_player: &mut self.gif_player,
-                    operation_result: &self.operation_result,
                     state: &self.state,
                 };
                 if let Some(event) = home.show(ui) {

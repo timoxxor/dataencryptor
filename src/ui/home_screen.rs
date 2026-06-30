@@ -7,7 +7,6 @@ use super::AppState;
 
 pub struct HomeScreen<'a> {
     pub gif_player: &'a mut Option<GifPlayer>,
-    pub operation_result: &'a Option<String>,
     pub state: &'a AppState,
 }
 
@@ -26,11 +25,6 @@ impl<'a> HomeScreen<'a> {
                     }
 
                     ui.add_space(15.0);
-
-                    if let Some(result) = &*self.operation_result {
-                        ui.colored_label(Color32::RED, result);
-                        ui.add_space(10.0);
-                    }
 
                     Frame::group(ui.style())
                         .fill(Color32::from_rgba_premultiplied(30, 30, 30, 150))
