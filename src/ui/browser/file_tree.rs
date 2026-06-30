@@ -5,7 +5,7 @@ use egui::{ScrollArea, Ui};
 
 use crate::deflate::FileEntry;
 
-use super::file_row::FileRow;
+use super::file_row::{FileRow, RenameAction};
 use super::folder_row::FolderRow;
 
 #[derive(Debug, Clone)]
@@ -14,26 +14,43 @@ pub enum DirectoryTreeAction {
     SelectFolder(String),
     SelectFile(FileEntry),
     ExecuteFile(FileEntry),
+    ContextMenu(FileEntry),
+    RenameCancel,
+    RenameSubmit {
+        old_path: String,
+        new_path: String,
+    },
 }
 
 pub struct FileTree<'a> {
     entries: &'a [FileEntry],
+    directories: &'a [String],
     current_vfs_dir: &'a str,
     selected_file: Option<&'a FileEntry>,
     directories_first: bool,
     show_icons: bool,
     allow_double_click: bool,
+    rename_path: Option<&'a str>,
+    rename_buffer: &'a mut String,
 }
 
 impl<'a> FileTree<'a> {
-    pub fn new(entries: &'a [FileEntry], current_vfs_dir: &'a str) -> Self {
+    pub fn new(
+        entries: &'a [FileEntry],
+        directories: &'a [String],
+        current_vfs_dir: &'a str,
+        rename_buffer: &'a mut String,
+    ) -> Self {
         Self {
             entries,
+            directories,
             current_vfs_dir,
             selected_file: None,
             directories_first: true,
             show_icons: true,
             allow_double_click: true,
+            rename_path: None,
+            rename_buffer,
         }
     }
 
@@ -57,8 +74,18 @@ impl<'a> FileTree<'a> {
         self
     }
 
+    pub fn renaming(mut self, path: Option<&'a str>) -> Self {
+        self.rename_path = path;
+        self
+    }
+
     pub fn show(self, ui: &mut Ui) -> DirectoryTreeAction {
-        let (sub_dirs, files) = categorize_entries(self.current_vfs_dir, self.entries);
+        let (mut sub_dirs, files) = categorize_entries(self.current_vfs_dir, self.entries);
+        for dir in self.directories {
+            if let Some(child) = get_child_dir(self.current_vfs_dir, dir) {
+                sub_dirs.insert(child);
+            }
+        }
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -98,17 +125,46 @@ impl<'a> FileTree<'a> {
                         .map(|f| f.offset == file.offset)
                         .unwrap_or(false);
 
-                    let resp = FileRow::new(&file_name)
+                    let is_renaming = self
+                        .rename_path
+                        .map(|p| p == file.path.as_str())
+                        .unwrap_or(false);
+
+                    let (resp, rename_result) = FileRow::new(&file_name, self.rename_buffer)
                         .selected(is_selected)
                         .show_icon(self.show_icons)
+                        .renaming(is_renaming)
                         .show(ui);
 
-                    if resp.clicked() {
+                    if let Some(rename_action) = rename_result {
+                        match rename_action {
+                            RenameAction::Cancel => {
+                                action = DirectoryTreeAction::RenameCancel;
+                            }
+                            RenameAction::Submit(new_name) => {
+                                if new_name != file_name.as_ref() {
+                                    let parent_dir = Path::new(&file.path)
+                                        .parent()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    let new_path = if parent_dir.is_empty() {
+                                        new_name
+                                    } else {
+                                        format!("{}/{}", parent_dir, new_name)
+                                    };
+                                    action = DirectoryTreeAction::RenameSubmit {
+                                        old_path: file.path.clone(),
+                                        new_path,
+                                    };
+                                }
+                            }
+                        }
+                    } else if resp.clicked() {
                         action = DirectoryTreeAction::SelectFile(file.clone());
-                    }
-
-                    if self.allow_double_click && resp.double_clicked() {
+                    } else if self.allow_double_click && resp.double_clicked() {
                         action = DirectoryTreeAction::ExecuteFile(file.clone());
+                    } else if resp.secondary_clicked() {
+                        action = DirectoryTreeAction::ContextMenu(file.clone());
                     }
                 }
 
@@ -136,6 +192,23 @@ fn categorize_entries<'a>(
     }
 
     (sub_dirs, current_files)
+}
+
+fn get_child_dir(current_vfs_dir: &str, dir: &str) -> Option<String> {
+    if current_vfs_dir.is_empty() {
+        dir.split('/').next().map(|s| s.to_owned())
+    } else {
+        let prefix = format!("{}/", current_vfs_dir);
+        if dir.starts_with(&prefix) {
+            dir.strip_prefix(&prefix)
+                .and_then(|rest| rest.split('/').next())
+                .map(|s| s.to_owned())
+        } else if dir == current_vfs_dir {
+            None
+        } else {
+            None
+        }
+    }
 }
 
 fn is_entry_in_current_dir(current_vfs_dir: &str, path: &Path) -> bool {

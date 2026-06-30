@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use egui::{Id, Ui};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use zeroize::Zeroize;
 
@@ -35,6 +36,9 @@ pub struct FileBrowserApp {
     pub background: particles::ParticleBackground,
     pub gif_player: Option<GifPlayer>,
     pub toast_manager: ToastManager,
+    pub context_menu: Option<(FileEntry, egui::Pos2)>,
+    pub rename_path: Option<String>,
+    pub rename_buffer: String,
 }
 
 impl FileBrowserApp {
@@ -59,6 +63,9 @@ impl FileBrowserApp {
             background: particles::ParticleBackground::default(),
             gif_player: Some(GifPlayer::new(ctx, "assets/title.gif")),
             toast_manager: ToastManager::new(),
+            context_menu: None,
+            rename_path: None,
+            rename_buffer: String::new(),
         }
     }
 
@@ -140,6 +147,44 @@ impl FileBrowserApp {
                         self.toast_manager
                             .info("Vault garbage collected successfully");
                     }
+                    WorkerResponse::FileRenamed {
+                        old_path,
+                        ref new_path,
+                    } => {
+                        if let Some(ref mut index) = self.container_index {
+                            if let Some(entry) =
+                                index.entries.iter_mut().find(|e| e.path == old_path)
+                            {
+                                entry.path.clone_from(new_path);
+                            }
+                        }
+                        if self
+                            .selected_file
+                            .as_ref()
+                            .map(|s| s.path == old_path)
+                            .unwrap_or(false)
+                        {
+                            if let Some(index) = &self.container_index {
+                                self.selected_file =
+                                    index.entries.iter().find(|e| e.path == *new_path).cloned();
+                            }
+                        }
+                        self.toast_manager.info("File renamed");
+                    }
+                    WorkerResponse::FileDeleted { path } => {
+                        if let Some(ref mut index) = self.container_index {
+                            index.entries.retain(|e| e.path != path);
+                        }
+                        if self
+                            .selected_file
+                            .as_ref()
+                            .map(|s| s.path == path)
+                            .unwrap_or(false)
+                        {
+                            self.selected_file = None;
+                        }
+                        self.toast_manager.info("File deleted from vault");
+                    }
                     WorkerResponse::Error { message } => {
                         if message != "Cancelled" {
                             self.toast_manager.error(message);
@@ -204,6 +249,24 @@ impl FileBrowserApp {
                 BrowserEvent::OpenFile(file) => {
                     if let Some(worker_tx) = &self.worker_tx {
                         let _ = worker_tx.send(WorkerCommand::ReadFile { entry: file });
+                    }
+                }
+                BrowserEvent::ContextMenu(file) => {
+                    self.context_menu = ctx.pointer_latest_pos().map(|pos| (file, pos));
+                }
+                BrowserEvent::RenameCancel => {
+                    self.rename_path = None;
+                }
+                BrowserEvent::RenameSubmit { old_path, new_path } => {
+                    self.rename_path = None;
+                    if let Some(tx) = &self.worker_tx {
+                        let _ = tx.send(WorkerCommand::RenameFile { old_path, new_path });
+                    }
+                }
+                BrowserEvent::DeleteFile(file) => {
+                    self.context_menu = None;
+                    if let Some(worker_tx) = &self.worker_tx {
+                        let _ = worker_tx.send(WorkerCommand::DeleteFile { entry: file });
                     }
                 }
             },
@@ -280,6 +343,114 @@ impl FileBrowserApp {
         }
     }
 
+    fn render_context_menu(&mut self, ctx: &egui::Context) {
+        let Some((file, pos)) = self.context_menu.clone() else {
+            return;
+        };
+
+        let area_id = egui::Id::new("file_context_menu");
+
+        let area_resp = egui::Area::new(area_id)
+            .fixed_pos(pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let frame = egui::Frame {
+                    fill: egui::Color32::from_rgba_unmultiplied(
+                        ui.style().visuals.window_fill().r(),
+                        ui.style().visuals.window_fill().g(),
+                        ui.style().visuals.window_fill().b(),
+                        220,
+                    ),
+                    stroke: ui.style().visuals.window_stroke(),
+                    corner_radius: egui::CornerRadius::ZERO,
+                    shadow: egui::epaint::Shadow::default(),
+                    ..Default::default()
+                };
+
+                frame.show(ui, |ui| {
+                    ui.set_width(100.0);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    let item = |ui: &mut egui::Ui, label: &str| -> bool {
+                        let galley = egui::WidgetText::from(label).into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Extend),
+                            f32::INFINITY,
+                            egui::TextStyle::Button,
+                        );
+
+                        let padding = ui.spacing().button_padding;
+                        let size =
+                            egui::vec2(ui.available_width(), galley.size().y + padding.y * 2.0);
+
+                        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+                        if response.hovered() {
+                            ui.painter()
+                                .rect_filled(rect, 0.0, egui::Color32::from_gray(55));
+                        }
+
+                        ui.painter().galley(
+                            rect.min + egui::vec2(padding.x, padding.y),
+                            galley,
+                            ui.style().visuals.text_color(),
+                        );
+
+                        response.clicked()
+                    };
+
+                    if item(ui, "Open") {
+                        self.context_menu = None;
+                        self.handle_event(
+                            AppEvent::Browser(BrowserEvent::OpenFile(file.clone())),
+                            ctx,
+                        );
+                        ui.close();
+                    }
+
+                    if item(ui, "Properties") {
+                        self.context_menu = None;
+                        self.handle_event(
+                            AppEvent::Browser(BrowserEvent::SelectFile(file.clone())),
+                            ctx,
+                        );
+                        ui.close();
+                    }
+
+                    if item(ui, "Rename") {
+                        self.context_menu = None;
+
+                        let file_name = Path::new(&file.path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
+
+                        self.rename_buffer = file_name.clone();
+
+                        ctx.data_mut(|d| {
+                            d.insert_persisted(Id::new("rename_sel_done").with(&file_name), false);
+                            d.insert_persisted(Id::new("rename_focus").with(&file_name), false);
+                        });
+
+                        self.rename_path = Some(file.path.clone());
+
+                        ui.close();
+                    }
+
+                    if item(ui, "Delete") {
+                        self.context_menu = None;
+                        self.handle_event(AppEvent::Browser(BrowserEvent::DeleteFile(file)), ctx);
+                        ui.close();
+                    }
+                });
+            });
+
+        if area_resp.response.clicked_elsewhere() {
+            self.context_menu = None;
+        }
+    }
+
     fn render_loading_popup(&mut self, ctx: &egui::Context) {
         if self.state == AppState::Loading {
             LoadingModal::new(self.progress, &self.progress_message).show(ctx);
@@ -314,8 +485,8 @@ impl eframe::App for FileBrowserApp {
                 self.render_password_popup(ui.ctx());
             }
             AppState::Browser => {
-                let entries = match &self.container_index {
-                    Some(index) => index.entries.clone(),
+                let (entries, directories) = match &self.container_index {
+                    Some(index) => (index.entries.clone(), index.directories.clone()),
                     None => {
                         self.state = AppState::Home;
                         return;
@@ -326,11 +497,16 @@ impl eframe::App for FileBrowserApp {
                     current_vfs_dir: &self.current_vfs_dir,
                     selected_file: self.selected_file.as_ref(),
                     entries: &entries,
+                    directories: &directories,
+                    rename_path: self.rename_path.as_deref(),
+                    rename_buffer: &mut self.rename_buffer,
                 };
 
                 if let Some(event) = browser.show(ui) {
                     self.handle_event(AppEvent::Browser(event), ui.ctx());
                 }
+
+                self.render_context_menu(ui.ctx());
             }
             AppState::Loading => {
                 let home = HomeScreen {

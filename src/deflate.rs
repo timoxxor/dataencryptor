@@ -53,6 +53,16 @@ pub struct FileEntry {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ContainerIndex {
     pub entries: Vec<FileEntry>,
+    pub directories: Vec<String>,
+}
+
+impl ContainerIndex {
+    pub fn new(entries: Vec<FileEntry>) -> Self {
+        Self {
+            entries,
+            directories: Vec::new(),
+        }
+    }
 }
 
 pub fn compress<W: Write>(data: &[u8], writer: W) -> io::Result<W> {
@@ -187,8 +197,14 @@ impl VaultReader {
         reader.read_to_end(&mut decrypted_index)?;
 
         let index_bytes = decompress(&decrypted_index)?;
-        let index: ContainerIndex = bincode::deserialize(&index_bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let index = match bincode::deserialize::<ContainerIndex>(&index_bytes) {
+            Ok(idx) => idx,
+            Err(_) => {
+                let entries: Vec<FileEntry> = bincode::deserialize(&index_bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                ContainerIndex::new(entries)
+            }
+        };
 
         Ok(Self {
             file: Some(file),
@@ -314,6 +330,59 @@ impl VaultReader {
         })
     }
 
+    fn write_index_to_end(&mut self) -> io::Result<()> {
+        let index_bytes = bincode::serialize(&self.index)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let compressed_index = compress(&index_bytes, Vec::new())?;
+
+        let index_key = self
+            .hkdf
+            .derive(b"index_key")
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "HKDF index key derivation failed"))?;
+
+        let mut ew = ChunkEncryptWriter::new(Vec::new(), &index_key, None)?;
+        ew.write_all(&compressed_index)?;
+        let encrypted_index = ew.finish()?;
+        let index_size = encrypted_index.len() as u64;
+
+        let salt = self.salt;
+        {
+            let file = self.file_mut();
+            let inner = file.get_mut();
+            inner.seek(SeekFrom::End(0))?;
+            let new_index_offset = inner.stream_position()?;
+            inner.write_all(&encrypted_index)?;
+
+            let final_header = Header {
+                magic: *MAGIC,
+                version: FORMAT_VERSION,
+                salt,
+                index_offset: new_index_offset,
+                index_size,
+            };
+            let final_header_bytes =
+                bincode::serialize(&final_header).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            inner.seek(SeekFrom::Start(0))?;
+            inner.write_all(&final_header_bytes)?;
+            inner.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn rename_entry(&mut self, old_path: &str, new_path: &str) -> io::Result<()> {
+        if let Some(entry) = self.index.entries.iter_mut().find(|e| e.path == old_path) {
+            entry.path = new_path.to_owned();
+        } else {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
+        }
+        self.write_index_to_end()
+    }
+
+    pub fn delete_entry(&mut self, path: &str) -> io::Result<()> {
+        self.index.entries.retain(|e| e.path != path);
+        self.write_index_to_end()
+    }
+
     pub fn garbage_collect(&mut self) -> io::Result<bool> {
         let file_size = {
             let file = self.file_ref();
@@ -376,6 +445,7 @@ impl VaultReader {
         let new_index_offset = writer.stream_position()?;
         let index_data = ContainerIndex {
             entries: new_entries,
+            directories: self.index.directories.clone(),
         };
         let index_bytes =
             bincode::serialize(&index_data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -438,10 +508,20 @@ pub fn create_container(
         .min_depth(1)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
         .collect();
 
-    let total_files = walker.len();
+    let total_files = walker.iter().filter(|e| e.file_type().is_file()).count();
+    let directories: Vec<String> = walker
+        .iter()
+        .filter(|e| e.file_type().is_dir())
+        .map(|e| {
+            e.path()
+                .strip_prefix(source_dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
 
     let _ = tx.send(ProgressMessage::Progress {
         current: 0,
@@ -550,7 +630,10 @@ pub fn create_container(
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "writer thread panicked"))??;
 
     let index_offset = pack_file.stream_position()?;
-    let index_data = ContainerIndex { entries };
+    let index_data = ContainerIndex {
+        entries,
+        directories,
+    };
     let index_bytes =
         bincode::serialize(&index_data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     drop(index_data);

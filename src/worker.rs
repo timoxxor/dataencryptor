@@ -23,6 +23,13 @@ pub enum WorkerCommand {
         progress_tx: mpsc::Sender<ProgressMessage>,
     },
     GarbageCollect,
+    DeleteFile {
+        entry: FileEntry,
+    },
+    RenameFile {
+        old_path: String,
+        new_path: String,
+    },
     CloseVault,
 }
 
@@ -37,6 +44,13 @@ pub enum WorkerResponse {
         entry: FileEntry,
     },
     GarbageCollected,
+    FileDeleted {
+        path: String,
+    },
+    FileRenamed {
+        old_path: String,
+        new_path: String,
+    },
     EncryptionDone,
     Error {
         message: String,
@@ -188,6 +202,37 @@ pub fn spawn() -> (mpsc::Sender<WorkerCommand>, mpsc::Receiver<WorkerResponse>) 
                             },
                         }
                     }
+                    WorkerCommand::DeleteFile { entry } => {
+                        let path = entry.path.clone();
+                        match vault.as_mut() {
+                            Some(reader) => match reader.delete_entry(&entry.path) {
+                                Ok(()) => WorkerResponse::FileDeleted { path },
+                                Err(e) => WorkerResponse::Error {
+                                    message: format!("Failed to delete file: {}", e),
+                                },
+                            },
+                            None => WorkerResponse::Error {
+                                message: "No vault is open".into(),
+                            },
+                        }
+                    }
+                    WorkerCommand::RenameFile {
+                        old_path,
+                        new_path,
+                    } => match vault.as_mut() {
+                        Some(reader) => match reader.rename_entry(&old_path, &new_path) {
+                            Ok(()) => WorkerResponse::FileRenamed {
+                                old_path,
+                                new_path,
+                            },
+                            Err(e) => WorkerResponse::Error {
+                                message: format!("Failed to rename file: {}", e),
+                            },
+                        },
+                        None => WorkerResponse::Error {
+                            message: "No vault is open".into(),
+                        },
+                    },
                     WorkerCommand::CloseVault => {
                         if let Some(ref mut reader) = vault {
                             let _ = reader.garbage_collect();

@@ -6,6 +6,13 @@ pub enum BrowserEvent {
     NavigateTo(String),
     SelectFile(FileEntry),
     OpenFile(FileEntry),
+    DeleteFile(FileEntry),
+    ContextMenu(FileEntry),
+    RenameCancel,
+    RenameSubmit {
+        old_path: String,
+        new_path: String,
+    },
     CloseVault,
 }
 

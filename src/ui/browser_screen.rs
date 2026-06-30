@@ -12,6 +12,9 @@ pub struct BrowserScreen<'a> {
     pub current_vfs_dir: &'a str,
     pub selected_file: Option<&'a FileEntry>,
     pub entries: &'a [FileEntry],
+    pub directories: &'a [String],
+    pub rename_path: Option<&'a str>,
+    pub rename_buffer: &'a mut String,
 }
 
 impl<'a> BrowserScreen<'a> {
@@ -36,12 +39,18 @@ impl<'a> BrowserScreen<'a> {
             ui.separator();
             ui.add_space(6.0);
 
-            let tree_action = FileTree::new(self.entries, self.current_vfs_dir)
-                .selected(self.selected_file)
-                .directories_first(true)
-                .show_icons(true)
-                .allow_double_click(true)
-                .show(ui);
+            let tree_action = FileTree::new(
+                self.entries,
+                self.directories,
+                self.current_vfs_dir,
+                self.rename_buffer,
+            )
+            .selected(self.selected_file)
+            .directories_first(true)
+            .show_icons(true)
+            .allow_double_click(true)
+            .renaming(self.rename_path)
+            .show(ui);
 
             match tree_action {
                 DirectoryTreeAction::None => {}
@@ -56,6 +65,21 @@ impl<'a> BrowserScreen<'a> {
                 DirectoryTreeAction::ExecuteFile(file) => {
                     result = Some(BrowserEvent::OpenFile(file));
                     return;
+                }
+                DirectoryTreeAction::ContextMenu(file) => {
+                    result = Some(BrowserEvent::ContextMenu(file));
+                }
+                DirectoryTreeAction::RenameCancel => {
+                    result = Some(BrowserEvent::RenameCancel);
+                }
+                DirectoryTreeAction::RenameSubmit {
+                    old_path,
+                    new_path,
+                } => {
+                    result = Some(BrowserEvent::RenameSubmit {
+                        old_path,
+                        new_path,
+                    });
                 }
             }
 
