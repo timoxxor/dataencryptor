@@ -10,7 +10,7 @@ use crate::worker::{WorkerCommand, WorkerResponse};
 
 use crate::ui::{
     AppEvent, AppState, BrowserEvent, BrowserScreen, CustomTitleBar, HomeEvent, HomeScreen,
-    LoadingModal, PasswordEvent, PasswordModal, ProgressMessage, ToastManager,
+    LoadingModal, PasswordEvent, PasswordModal, ProgressMessage, PropertiesDialog, ToastManager,
 };
 
 pub struct FileBrowserApp {
@@ -39,6 +39,7 @@ pub struct FileBrowserApp {
     pub context_menu: Option<(FileEntry, egui::Pos2)>,
     pub rename_path: Option<String>,
     pub rename_buffer: String,
+    pub properties_dialog: PropertiesDialog,
 }
 
 impl FileBrowserApp {
@@ -66,6 +67,7 @@ impl FileBrowserApp {
             context_menu: None,
             rename_path: None,
             rename_buffer: String::new(),
+            properties_dialog: PropertiesDialog::new(),
         }
     }
 
@@ -410,10 +412,7 @@ impl FileBrowserApp {
 
                     if item(ui, "Properties") {
                         self.context_menu = None;
-                        self.handle_event(
-                            AppEvent::Browser(BrowserEvent::SelectFile(file.clone())),
-                            ctx,
-                        );
+                        self.properties_dialog.open(file.clone());
                         ui.close();
                     }
 
@@ -507,6 +506,7 @@ impl eframe::App for FileBrowserApp {
                 }
 
                 self.render_context_menu(ui.ctx());
+                self.properties_dialog.show(ui.ctx());
             }
             AppState::Loading => {
                 let home = HomeScreen {
