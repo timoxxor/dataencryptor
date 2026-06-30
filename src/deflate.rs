@@ -80,7 +80,10 @@ fn should_compress(path: &Path, file_size: u64) -> bool {
         .map(|e| e.to_ascii_lowercase())
         .as_deref()
     {
-        Some("jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico" | "heic" | "avif") => false,
+        Some(
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico" | "heic"
+            | "avif",
+        ) => false,
         Some("mp4" | "mkv" | "avi" | "mov" | "wmv" | "flv" | "webm" | "m4v") => false,
         Some("mp3" | "flac" | "wav" | "aac" | "ogg" | "wma" | "m4a") => false,
         Some("zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst") => false,
@@ -97,13 +100,17 @@ struct FileWork {
     compressed: bool,
 }
 
+const MAX_POOL_BUFFER: usize = 64 * 1024 * 1024;
+
 struct BufferPool {
     inner: Mutex<Vec<Vec<u8>>>,
 }
 
 impl BufferPool {
     fn new() -> Self {
-        Self { inner: Mutex::new(Vec::new()) }
+        Self {
+            inner: Mutex::new(Vec::new()),
+        }
     }
 
     fn acquire(&self, capacity: usize) -> Vec<u8> {
@@ -112,13 +119,18 @@ impl BufferPool {
             .pop()
             .map(|mut v| {
                 v.clear();
-                v.reserve(capacity);
+                if v.capacity() < capacity {
+                    v.reserve(capacity - v.capacity());
+                }
                 v
             })
             .unwrap_or_else(|| Vec::with_capacity(capacity))
     }
 
     fn release(&self, buf: Vec<u8>) {
+        if buf.capacity() > MAX_POOL_BUFFER {
+            return;
+        }
         let mut inner = self.inner.lock().unwrap();
         inner.push(buf);
     }
@@ -243,12 +255,7 @@ pub fn create_container(
 
                 let mut entries = Vec::with_capacity(total_files);
 
-                for _ in 0..total_files {
-                    let work = match work_rx.recv() {
-                        Ok(w) => w,
-                        Err(_) => break,
-                    };
-
+                while let Ok(work) = work_rx.recv() {
                     let offset = pack_file.stream_position()?;
                     pack_file.write_all(&work.data)?;
                     let stored_size = work.data.len() as u64;
@@ -284,7 +291,7 @@ pub fn create_container(
             .to_string_lossy()
             .into_owned();
 
-        let file_size = std::fs::metadata(full_path)?.len();
+        let file_size = entry.metadata()?.len();
         let uuid = Uuid::new_v4().to_bytes_le();
         let compressed = should_compress(full_path, file_size);
 
@@ -292,7 +299,7 @@ pub fn create_container(
             .derive(&uuid)
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "hkdf derive failed"))?;
 
-        let _cur = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = counter.fetch_add(1, Ordering::Relaxed) + 1;
 
         let inner = pool.acquire(file_size as usize);
         let ew = ChunkEncryptWriter::new(inner, &file_key, Some(uuid))?;
