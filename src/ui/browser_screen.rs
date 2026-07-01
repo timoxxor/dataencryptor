@@ -1,12 +1,109 @@
-use egui::{Frame, Ui};
+use egui::{Align, Frame, Layout, RichText, Ui};
 
 use crate::deflate::FileEntry;
 
-use super::browser::{
-    BreadcrumbAction, BreadcrumbBar, DirectoryTreeAction, FileDetailsAction, FileDetailsView,
-    FileTree,
-};
-use super::event::BrowserEvent;
+use super::browser::{DirectoryTreeAction, FileTree};
+use super::types::BrowserEvent;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BreadcrumbAction {
+    None,
+    Exit,
+    NavigateTo(String),
+}
+
+pub struct BreadcrumbBar<'a> {
+    current_vfs_dir: &'a str,
+}
+
+impl<'a> BreadcrumbBar<'a> {
+    pub fn new(current_vfs_dir: &'a str) -> Self {
+        Self { current_vfs_dir }
+    }
+
+    pub fn show(self, ui: &mut Ui) -> BreadcrumbAction {
+        let mut action = BreadcrumbAction::None;
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("📦").size(20.0));
+
+            if ui.small_button("Root").clicked() {
+                action = BreadcrumbAction::NavigateTo(String::new());
+            }
+
+            let mut accum = String::new();
+
+            for component in self
+                .current_vfs_dir
+                .split('/')
+                .filter(|s| !s.is_empty())
+            {
+                ui.label(RichText::new("›").weak().size(16.0));
+
+                if accum.is_empty() {
+                    accum.push_str(component);
+                } else {
+                    accum.push('/');
+                    accum.push_str(component);
+                }
+
+                if ui.small_button(component).clicked() {
+                    action = BreadcrumbAction::NavigateTo(accum.clone());
+                }
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Exit").clicked() {
+                    action = BreadcrumbAction::Exit;
+                }
+            });
+        });
+
+        action
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum FileDetailsAction {
+    None,
+    Open(FileEntry),
+}
+
+pub struct FileDetailsView<'a> {
+    selected_file: Option<&'a FileEntry>,
+}
+
+impl<'a> FileDetailsView<'a> {
+    pub fn new(selected_file: Option<&'a FileEntry>) -> Self {
+        Self { selected_file }
+    }
+
+    pub fn show(self, ui: &mut Ui) -> FileDetailsAction {
+        let mut action = FileDetailsAction::None;
+
+        ui.vertical(|ui| {
+            if let Some(file) = self.selected_file {
+                ui.heading("📄 File Information");
+                ui.add_space(4.0);
+
+                ui.label(format!("Virtual Path: {}", file.path));
+                ui.label(format!("Size: {} bytes", file.stored_size));
+
+                ui.add_space(8.0);
+                if ui
+                    .button(RichText::new("🚀 Open in System").strong())
+                    .clicked()
+                {
+                    action = FileDetailsAction::Open(file.clone());
+                }
+            } else {
+                ui.colored_label(egui::Color32::GRAY, "Select a file to view details");
+            }
+        });
+
+        action
+    }
+}
 
 pub struct BrowserScreen<'a> {
     pub current_vfs_dir: &'a str,

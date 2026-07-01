@@ -1,9 +1,9 @@
-use egui::{Align, Layout, RichText, Sense, Vec2, ViewportCommand, Ui};
+use egui::{Align, Layout, Response, RichText, Sense, Ui, Vec2, ViewportCommand, Widget};
 
 pub struct CustomTitleBar;
 
-impl CustomTitleBar {
-    pub fn show(ui: &mut Ui) {
+impl Widget for CustomTitleBar {
+    fn ui(self, ui: &mut Ui) -> Response<> {
         let height = 32.0;
         let (rect, response) = ui.allocate_exact_size(
             Vec2::new(ui.available_width(), height),
@@ -35,5 +35,7 @@ impl CustomTitleBar {
                 ui.ctx().send_viewport_cmd(ViewportCommand::Close);
             }
         });
+
+        response
     }
 }

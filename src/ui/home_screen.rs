@@ -1,8 +1,9 @@
 use egui::{CentralPanel, Color32, Frame, Ui};
+use glow_bloom::{BloomRenderer, BloomText};
 
 use crate::gif_player::GifPlayer;
 
-use super::event::HomeEvent;
+use super::types::HomeEvent;
 use super::AppState;
 
 pub struct HomeScreen<'a> {

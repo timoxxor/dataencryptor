@@ -1,6 +1,6 @@
 use egui::{Context, Window, ProgressBar};
 
-use super::state::AppState;
+use super::types::AppState;
 
 pub struct LoadingModal<'a> {
     progress: f32,

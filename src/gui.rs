@@ -82,7 +82,7 @@ impl eframe::App for FileBrowserApp {
         self.background.update_and_draw(ui);
         self.toast_manager.show(ui.ctx());
 
-        CustomTitleBar::show(ui);
+        ui.add(CustomTitleBar);
         ui.add_space(10.0);
 
         handler::check_progress(self);
