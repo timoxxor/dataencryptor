@@ -159,10 +159,10 @@ impl<'a> FileTree<'a> {
                                 }
                             }
                         }
-                    } else if resp.clicked() {
-                        action = DirectoryTreeAction::SelectFile(file.clone());
                     } else if self.allow_double_click && resp.double_clicked() {
                         action = DirectoryTreeAction::ExecuteFile(file.clone());
+                    } else if resp.clicked() {
+                        action = DirectoryTreeAction::SelectFile(file.clone());
                     } else if resp.secondary_clicked() {
                         action = DirectoryTreeAction::ContextMenu(file.clone());
                     }

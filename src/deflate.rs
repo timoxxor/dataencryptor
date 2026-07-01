@@ -540,7 +540,8 @@ pub fn create_container(
         std::thread::Builder::new()
             .name("vault-writer".into())
             .spawn(move || -> io::Result<(BufWriter<File>, Vec<FileEntry>)> {
-                let raw = File::create(&output_pack)?;
+                let raw = File::create(&output_pack)
+                    .map_err(|e| io::Error::new(e.kind(), format!("failed to create {:?}: {}", output_pack, e)))?;
                 let mut pack_file = BufWriter::new(raw);
 
                 let header_bytes = bincode::serialize(&Header::new(&salt))
@@ -577,29 +578,33 @@ pub fn create_container(
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
     };
 
-    walker.par_iter().try_for_each(|entry| -> io::Result<()> {
-        let full_path = entry.path();
-        let relative_path = full_path
-            .strip_prefix(source_dir)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+    walker
+        .par_iter()
+        .filter(|e| e.file_type().is_file())
+        .try_for_each(|entry| -> io::Result<()> {
+            let full_path = entry.path();
+            let relative_path = full_path
+                .strip_prefix(source_dir)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
 
-        let file_size = entry.metadata()?.len();
-        let uuid = Uuid::new_v4().to_bytes_le();
-        let compressed = should_compress(full_path, file_size);
+            let file_size = entry.metadata()?.len();
+            let uuid = Uuid::new_v4().to_bytes_le();
+            let compressed = should_compress(full_path, file_size);
 
-        let file_key = hkdf
-            .derive(&uuid)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "hkdf derive failed"))?;
+            let file_key = hkdf
+                .derive(&uuid)
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "hkdf derive failed"))?;
 
-        let _ = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            let _ = counter.fetch_add(1, Ordering::Relaxed) + 1;
 
-        let inner = pool.acquire(file_size as usize);
-        let ew = ChunkEncryptWriter::new(inner, &file_key, Some(uuid))?;
+            let inner = pool.acquire(file_size as usize);
+            let ew = ChunkEncryptWriter::new(inner, &file_key, Some(uuid))?;
 
-        let mut file = File::open(full_path)?;
-        let data = if compressed {
+            let mut file = File::open(full_path)
+                .map_err(|e| io::Error::new(e.kind(), format!("failed to open {:?}: {}", full_path, e)))?;
+            let data = if compressed {
             let mut encoder = DeflateEncoder::new(ew, Compression::new(3));
             io::copy(&mut file, &mut encoder)?;
             encoder
@@ -610,18 +615,18 @@ pub fn create_container(
             let mut ew = ew;
             io::copy(&mut file, &mut ew)?;
             ew.finish()?
-        };
+            };
 
-        let _ = work_tx.send(FileWork {
-            data,
-            id: uuid,
-            path: relative_path,
-            original_size: file_size,
-            compressed,
-        });
+            let _ = work_tx.send(FileWork {
+                data,
+                id: uuid,
+                path: relative_path,
+                original_size: file_size,
+                compressed,
+            });
 
-        Ok(())
-    })?;
+            Ok(())
+        })?;
 
     drop(work_tx);
 

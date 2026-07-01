@@ -14,6 +14,9 @@ pub enum ProgressMessage {
         total: usize,
         message: String,
     },
+}
+
+pub enum DialogMessage {
     FolderPicked(PathBuf),
     SaveLocationPicked(PathBuf),
     OpenLocationPicked(PathBuf),

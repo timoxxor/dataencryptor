@@ -1,7 +1,6 @@
 use eframe::egui;
 use image::AnimationDecoder;
-use std::fs::File;
-use std::io::BufReader;
+use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 pub struct GifPlayer {
@@ -12,9 +11,8 @@ pub struct GifPlayer {
 }
 
 impl GifPlayer {
-    pub fn new(ctx: &egui::Context, gif_path: &str) -> Self {
-        let file = File::open(gif_path).expect("Failed to open GIF file");
-        let reader = BufReader::new(file);
+    pub fn new(ctx: &egui::Context, gif_data: &[u8]) -> Self {
+        let reader = Cursor::new(gif_data);
         let decoder = image::codecs::gif::GifDecoder::new(reader).expect("Ошибка декодирования");
         let decoded_frames = decoder
             .into_frames()

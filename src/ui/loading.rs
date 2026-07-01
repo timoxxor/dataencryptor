@@ -1,5 +1,7 @@
 use egui::{Context, Window, ProgressBar};
 
+use super::state::AppState;
+
 pub struct LoadingModal<'a> {
     progress: f32,
     message: &'a str,
@@ -24,5 +26,28 @@ impl<'a> LoadingModal<'a> {
                     ui.add_space(4.0);
                 });
             });
+    }
+}
+
+pub struct LoadingPopup<'a> {
+    state: &'a AppState,
+    progress: f32,
+    message: &'a str,
+}
+
+impl<'a> LoadingPopup<'a> {
+    pub fn new(state: &'a AppState, progress: f32, message: &'a str) -> Self {
+        Self {
+            state,
+            progress,
+            message,
+        }
+    }
+
+    pub fn show(self, ctx: &Context) {
+        if *self.state != AppState::Loading {
+            return;
+        }
+        LoadingModal::new(self.progress, self.message).show(ctx);
     }
 }
