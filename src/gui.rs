@@ -1,15 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Arc;
+
+use glow_bloom::BloomRenderer;
 
 use crate::deflate::{ContainerIndex, FileEntry};
-use crate::gif_player::GifPlayer;
 use crate::handler;
 use crate::particles;
 use crate::theme;
 use crate::ui::{
     AppEvent, AppState, BrowserEvent, BrowserScreen, ContextMenu, ContextMenuAction,
     CustomTitleBar, DialogMessage, HomeScreen, LoadingPopup, PasswordPopup, ProgressMessage,
-    PropertiesDialog, ToastManager,
+    PropertiesDialog, ToastManager, Typewriter,
 };
 use crate::worker::{WorkerCommand, WorkerResponse};
 
@@ -36,7 +38,8 @@ pub struct FileBrowserApp {
     pub progress_message: String,
 
     pub background: particles::ParticleBackground,
-    pub gif_player: Option<GifPlayer>,
+    pub bloom_renderer: Arc<egui::mutex::Mutex<BloomRenderer>>,
+    pub typewriter: Typewriter,
     pub toast_manager: ToastManager,
     pub context_menu: Option<(FileEntry, egui::Pos2)>,
     pub rename_path: Option<String>,
@@ -45,8 +48,10 @@ pub struct FileBrowserApp {
 }
 
 impl FileBrowserApp {
-    pub fn new(ctx: &egui::Context, file_to_open: Option<PathBuf>) -> Self {
+    pub fn new(_ctx: &egui::Context, gl: &eframe::glow::Context, file_to_open: Option<PathBuf>) -> Self {
         let (worker_tx, worker_rx) = crate::worker::spawn();
+        let font_data = include_bytes!("../assets/Courier 10 Pitch Bold.otf").to_vec();
+        let renderer = BloomRenderer::new(gl, font_data);
 
         Self {
             state: AppState::Home,
@@ -66,7 +71,8 @@ impl FileBrowserApp {
             progress: 0.0,
             progress_message: String::new(),
             background: particles::ParticleBackground::default(),
-            gif_player: Some(GifPlayer::new(ctx, include_bytes!("../assets/title.gif"))),
+            bloom_renderer: Arc::new(egui::mutex::Mutex::new(renderer)),
+            typewriter: Typewriter::new("Encrypted Virtual File System"),
             toast_manager: ToastManager::new(),
             context_menu: None,
             rename_path: None,
@@ -93,7 +99,8 @@ impl eframe::App for FileBrowserApp {
         match self.state {
             AppState::Home => {
                 let home = HomeScreen {
-                    gif_player: &mut self.gif_player,
+                    bloom_renderer: &self.bloom_renderer,
+                    typewriter: &mut self.typewriter,
                     state: &self.state,
                 };
                 if let Some(event) = home.show(ui) {
@@ -193,7 +200,8 @@ impl eframe::App for FileBrowserApp {
             }
             AppState::Loading => {
                 let home = HomeScreen {
-                    gif_player: &mut self.gif_player,
+                    bloom_renderer: &self.bloom_renderer,
+                    typewriter: &mut self.typewriter,
                     state: &self.state,
                 };
                 if let Some(event) = home.show(ui) {
@@ -212,6 +220,12 @@ impl eframe::App for FileBrowserApp {
                 LoadingPopup::new(&self.state, self.progress, &self.progress_message)
                     .show(ui.ctx());
             }
+        }
+    }
+
+    fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
+        if let Some(gl) = gl {
+            self.bloom_renderer.lock().destroy(gl);
         }
     }
 }

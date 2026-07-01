@@ -11,7 +11,7 @@ pub mod types;
 
 pub use browser_screen::BrowserScreen;
 pub use context_menu::{ContextMenu, ContextMenuAction};
-pub use home_screen::HomeScreen;
+pub use home_screen::{HomeScreen, Typewriter};
 pub use loading::LoadingPopup;
 pub use password::PasswordPopup;
 pub use properties::PropertiesDialog;

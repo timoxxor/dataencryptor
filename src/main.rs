@@ -5,7 +5,6 @@ mod dialog;
 mod gui;
 mod handler;
 mod particles;
-mod gif_player;
 mod theme;
 mod ui;
 mod worker;
@@ -26,6 +25,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "EVFS App",
         options,
-        Box::new(|cc| Ok(Box::new(gui::FileBrowserApp::new(&cc.egui_ctx, file_to_open)))),
+        Box::new(|cc| {
+            let gl = cc.gl.as_ref().expect("Need glow backend");
+            Ok(Box::new(gui::FileBrowserApp::new(&cc.egui_ctx, gl, file_to_open)))
+        }),
     )
 }
